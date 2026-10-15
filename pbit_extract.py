@@ -504,6 +504,8 @@ CSV_COLUMNS = [
     "from_table", "from_column", "to_table", "to_column",
     "cardinality", "cross_filter",
     "depends_on",
+    "source_path",
+    "source_page",
     "extra",
 ]
 
@@ -559,6 +561,12 @@ def _rows_for_table(
             and _CALC_TABLE_DAX_RE.search(_pt_expr(p))
             for p in partitions
         )
+        or any(
+            _pt_type(p) != "calculated"
+            and _pt_expr(p).strip()
+            and _pt_expr(p).lstrip().lower().startswith("let")
+            for p in partitions
+        )
     )
 
     # ---- table row ----
@@ -568,6 +576,9 @@ def _rows_for_table(
     row["name"] = table_name
     row["is_hidden"] = str(table.get("isHidden", False)).lower()
     row["description"] = table.get("description", "")
+    # Determine source language for the table (M or DAX)
+    table_source_lang = "DAX" if any(_pt_type(p) == "calculated" for p in partitions) else "M"
+    row["source"] = table_source_lang
     rows.append(row)
 
     # ---- partition rows + Fix #3 table_dependency ----
@@ -593,7 +604,11 @@ def _rows_for_table(
         row["expression_language"] = expr_lang
         row["source"] = sanitize(connector) if do_sanitize else connector
         row["extra"] = pt.get("mode", "")
+        # Fill source_path for partition rows (already set later globally)
+        row["source_path"] = ""
+        row["source_page"] = ""
         rows.append(row)
+
 
         # Fix #3 — table_dependency rows for calculated-table DAX expressions
         if expr_lang == "DAX" and pt_expr_str and all_table_names:
@@ -614,7 +629,7 @@ def _rows_for_table(
     # ---- column rows ----
     for col in parser.get_columns(table):
         col_name = col.get("name", "")
-        is_calc = col.get("isCalculated", False)
+        is_calc = col.get("isCalculated", False) or bool(col.get("expression"))
         raw_expr = col.get("expression", "")
         expr_out = (sanitize(raw_expr) if do_sanitize else raw_expr) if is_calc else ""
         source_col = col.get("sourceColumn", "")
@@ -747,6 +762,7 @@ def _rows_for_report(report_data: dict) -> list:
         row["object_type"] = "page"
         row["name"] = page_name
         row["page"] = page_name
+        row["source_page"] = page_name
         rows.append(row)
 
         for visual in page.get("visuals", []):
@@ -778,7 +794,7 @@ def _rows_for_report(report_data: dict) -> list:
                 row["visual_title"] = v_title
                 row["field"] = field_str
                 row["role"] = role_str
-                rows.append(row)
+                row["source_page"] = page_name
 
     return rows
 
@@ -868,14 +884,22 @@ def main() -> None:
         print(f"  Pages:         {n_pages}")
         print(f"  Visuals:       {n_visuals}")
 
-    # Build all CSV rows
-    all_rows: list = []
-
     # Pass all_table_names for Fix #3 DAX dependency analysis
     all_table_names = [t.get("name", "") for t in tables]
 
+    # Remember source path for all rows (the .pbit file)
+    source_path_str = str(input_path.resolve())
+
+    all_rows = []
     for table in tables:
         all_rows.extend(_rows_for_table(table, parser, do_sanitize, all_table_names))
+
+    # After rows built, fill source_path for every row
+    # After building rows, fill source_path for every row (already done earlier) and ensure source_page already set.
+    for r in all_rows:
+        r["source_path"] = source_path_str
+        # source_page already set where applicable; keep as is.
+
 
     all_rows.extend(_rows_for_shared_expressions(parser, do_sanitize))
     all_rows.extend(_rows_for_relationships(parser))

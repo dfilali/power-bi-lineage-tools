@@ -25,7 +25,15 @@ python pbit_extract.py mon_rapport.pbit --delimiter , --no-sanitize
 | `--delimiter` / `-d` | `;` | CSV column delimiter |
 | `--no-sanitize` | *(off)* | Disable masking of org-specific connection strings |
 
-**CSV columns (25)**
+28: **CSV columns (27)**
+29:
+30: ```
+31: object_type, table, name, parent, data_type, is_calculated, is_hidden,
+32: expression, expression_language, source, format_string, description,
+33: display_folder, page, visual_type, visual_title, field, role,
+34: from_table, from_column, to_table, to_column, cardinality, cross_filter,
+35: depends_on, source_path, source_page, extra
+36: ```
 
 ```
 object_type, table, name, parent, data_type, is_calculated, is_hidden,
