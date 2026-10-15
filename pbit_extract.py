@@ -442,10 +442,58 @@ def open_pbit(pbit_path: Path) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# DAX dependency analyser
+# ---------------------------------------------------------------------------
+
+# Matches 'TableName'[ColumnOrMeasure] or TableName[ColumnOrMeasure]
+_DAX_TABLE_REF_RE = re.compile(
+    r"'?([A-Za-z0-9_ ]+)'?\[[^\]]+\]",
+)
+
+
+def _normalize_expr(raw) -> str:
+    """Flatten a list-of-lines expression to a single string.
+
+    Fix #4: TMSL sometimes stores expressions as ["line1", "line2", ...]
+    instead of a plain string.  All dependency analysis and connector
+    detection must work on the flattened string, not the raw list.
+    """
+    if isinstance(raw, list):
+        return "\n".join(raw)
+    return str(raw or "")
+
+
+def _extract_dax_table_refs(dax: str, all_table_names: list) -> list:
+    """Return sorted list of table names referenced in a DAX expression.
+
+    Two strategies:
+    1. Pattern 'TableName'[Field] / TableName[Field] — catches most cases.
+    2. Whole-word match of every known table name — catches SUMMARIZECOLUMNS
+       and other functions that reference tables without a column qualifier.
+    """
+    found: set = set()
+
+    # Strategy 1 — bracketed references
+    for m in _DAX_TABLE_REF_RE.finditer(dax):
+        t = m.group(1).strip()
+        if t:
+            found.add(t)
+
+    # Strategy 2 — whole-word table name scan
+    for t in all_table_names:
+        if not t:
+            continue
+        if re.search(r"\b" + re.escape(t) + r"\b", dax, re.IGNORECASE):
+            found.add(t)
+
+    return sorted(found)
+
+
+# ---------------------------------------------------------------------------
 # CSV row builders
 # ---------------------------------------------------------------------------
 
-# Fixed column order (25 columns)
+# Fixed column order (26 columns — added "depends_on" for table_dependency)
 CSV_COLUMNS = [
     "object_type", "table", "name", "parent",
     "data_type", "is_calculated", "is_hidden",
@@ -455,6 +503,7 @@ CSV_COLUMNS = [
     "field", "role",
     "from_table", "from_column", "to_table", "to_column",
     "cardinality", "cross_filter",
+    "depends_on",
     "extra",
 ]
 
@@ -463,16 +512,54 @@ def _blank_row() -> dict:
     return {col: "" for col in CSV_COLUMNS}
 
 
-def _rows_for_table(table: dict, parser: TMSLParser, do_sanitize: bool) -> list:
+# Fix #2 — _is_calc_table: normalise list before regex check, and
+# Fix #1 — detect SUMMARIZECOLUMNS() in addition to SUMMARIZE()
+_CALC_TABLE_DAX_RE = re.compile(
+    r"\b(SUMMARIZE|SUMMARIZECOLUMNS|DATATABLE|GENERATESERIES|CALENDAR|CALENDARAUTO"
+    r"|UNION|INTERSECT|EXCEPT|CROSSJOIN|GENERATE|GENERATEALL"
+    r"|ADDCOLUMNS|SELECTCOLUMNS|ROW|TOPN|SAMPLE|FILTERS|VALUES|ALL|ALLNOBLANKROW)"
+    r"\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _rows_for_table(
+    table: dict,
+    parser: TMSLParser,
+    do_sanitize: bool,
+    all_table_names: Optional[list] = None,
+) -> list:
     """Yield CSV row dicts for a single table and all its children."""
     rows = []
     table_name = table.get("name", "")
     partitions = parser.get_partitions(table)
 
-    # Determine if this is a calculated table (DAX) or M-based
-    is_calc_table = bool(table.get("calculationGroup") or
-                         any(p.get("source", {}).get("type", "") == "calculated"
-                             for p in partitions))
+    # Fix #4 — normalise the partition source expression to str FIRST so that
+    # every downstream check (is_calc_table, _detect_connector, dep analysis)
+    # works on a plain string, not a raw list.
+    def _pt_expr(pt: dict) -> str:
+        src = pt.get("source", {})
+        if isinstance(src, str):
+            return ""
+        raw = src.get("expression", src.get("query", ""))
+        return _normalize_expr(raw).strip()
+
+    def _pt_type(pt: dict) -> str:
+        src = pt.get("source", {})
+        if isinstance(src, str):
+            return ""
+        return src.get("type", "")
+
+    # Fix #1 + #2 — is_calc_table now uses normalised expr and SUMMARIZECOLUMNS
+    is_calc_table = bool(
+        table.get("calculationGroup")
+        or any(_pt_type(p) == "calculated" for p in partitions)
+        or any(
+            _pt_type(p) != "calculated"
+            and _CALC_TABLE_DAX_RE.search(_pt_expr(p))
+            for p in partitions
+        )
+    )
 
     # ---- table row ----
     row = _blank_row()
@@ -483,26 +570,19 @@ def _rows_for_table(table: dict, parser: TMSLParser, do_sanitize: bool) -> list:
     row["description"] = table.get("description", "")
     rows.append(row)
 
-    # ---- partition rows ----
+    # ---- partition rows + Fix #3 table_dependency ----
     for pt in partitions:
-        src = pt.get("source", {})
-        if isinstance(src, str):
-            src = {}
+        pt_expr_str = _pt_expr(pt)
+        pt_type_str = _pt_type(pt)
 
-        pt_type = src.get("type", "")
-        raw_expr = src.get("expression", src.get("query", ""))
-        if isinstance(raw_expr, list):
-            raw_expr = "\n".join(raw_expr)
-        raw_expr = (raw_expr or "").strip()
-
-        expr_lang = "DAX" if pt_type == "calculated" else "M"
+        expr_lang = "DAX" if pt_type_str == "calculated" else "M"
         connector = ""
-        if expr_lang == "M" and raw_expr:
-            connector = _detect_connector(raw_expr)
+        if expr_lang == "M" and pt_expr_str:
+            connector = _detect_connector(pt_expr_str)
         elif expr_lang == "DAX":
             connector = "DAX"
 
-        expr_out = (sanitize(raw_expr) if do_sanitize else raw_expr)
+        expr_out = (sanitize(pt_expr_str) if do_sanitize else pt_expr_str)
 
         row = _blank_row()
         row["object_type"] = "partition"
@@ -514,6 +594,22 @@ def _rows_for_table(table: dict, parser: TMSLParser, do_sanitize: bool) -> list:
         row["source"] = sanitize(connector) if do_sanitize else connector
         row["extra"] = pt.get("mode", "")
         rows.append(row)
+
+        # Fix #3 — table_dependency rows for calculated-table DAX expressions
+        if expr_lang == "DAX" and pt_expr_str and all_table_names:
+            deps = _extract_dax_table_refs(pt_expr_str, all_table_names)
+            for dep_table in deps:
+                if dep_table == table_name:
+                    continue  # skip self-reference
+                dep_row = _blank_row()
+                dep_row["object_type"] = "table_dependency"
+                dep_row["table"] = table_name
+                dep_row["name"] = table_name
+                dep_row["parent"] = dep_table
+                dep_row["depends_on"] = dep_table
+                dep_row["expression_language"] = "DAX"
+                dep_row["extra"] = pt.get("name", "")
+                rows.append(dep_row)
 
     # ---- column rows ----
     for col in parser.get_columns(table):
@@ -775,8 +871,11 @@ def main() -> None:
     # Build all CSV rows
     all_rows: list = []
 
+    # Pass all_table_names for Fix #3 DAX dependency analysis
+    all_table_names = [t.get("name", "") for t in tables]
+
     for table in tables:
-        all_rows.extend(_rows_for_table(table, parser, do_sanitize))
+        all_rows.extend(_rows_for_table(table, parser, do_sanitize, all_table_names))
 
     all_rows.extend(_rows_for_shared_expressions(parser, do_sanitize))
     all_rows.extend(_rows_for_relationships(parser))
