@@ -479,12 +479,21 @@ def _extract_dax_table_refs(dax: str, all_table_names: list) -> list:
         if t:
             found.add(t)
 
-    # Strategy 2 — whole-word table name scan
+    # Strategy 2 — whole-word or quoted identifier match of known table names
     for t in all_table_names:
         if not t:
             continue
-        if re.search(r"\b" + re.escape(t) + r"\b", dax, re.IGNORECASE):
+        # Allow optional single or double quotes around the table name
+        pattern = r"(?:'|\")?" + re.escape(t) + r"(?:'|\")?"
+        if re.search(pattern, dax, re.IGNORECASE):
             found.add(t)
+
+    # Strategy 3 — capture first argument of SUMMARIZECOLUMNS (and SUMMARIZE) when it is a table name
+    for func in ("SUMMARIZECOLUMNS", "SUMMARIZE"):
+        for m in re.finditer(r"(?i)" + func + r"\s*\(\s*([^\),]+)", dax):
+            arg = m.group(1).strip().strip('"').strip("'")
+            if arg:
+                found.add(arg)
 
     return sorted(found)
 
